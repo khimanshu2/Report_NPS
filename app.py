@@ -18,6 +18,20 @@ st.set_page_config(page_title="Call & Patient Report Automation", layout="wide")
 # ---------------------------- CONSTANTS ----------------------------
 # ------------------------------------------------------------------
 
+# *** FIX: DASH NORMALIZATION ***
+# Excel/CSV exports frequently save the dash inside "Connected – Feedback
+# Positive" using different characters depending on the machine/locale that
+# created the file: a plain hyphen "-", an en-dash "–" (U+2013), an em-dash
+# "—" (U+2014), a minus sign "−" (U+2212), or a mangled mojibake sequence
+# like "â€“". If the source file's dash doesn't EXACTLY match the hardcoded
+# en-dash used below, str.isin() silently fails to match that row, and it
+# falls through into "General Query" instead of "Positive/Negative Feedback"
+# — which is why totals were coming out much lower than expected.
+#
+# This regex catches every common dash-like character and folds it down to
+# a single plain hyphen "-", both in the hardcoded category lists below AND
+# in the actual Sub Disposition column read from df2 (see prepare_df2()).
+# That way matching works no matter which dash variant the file used.
 _DASH_RE = re.compile(r'[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]')
 
 
@@ -43,6 +57,11 @@ NEGATIVE_LOWER = {normalize_dashes(x.strip().lower()) for x in NEGATIVE_LIST}
 LANGUAGE_LOWER = {normalize_dashes(x.strip().lower()) for x in LANGUAGE_LIST}
 EXCLUDED_LOWER = POSITIVE_LOWER | NEGATIVE_LOWER
 
+# These are the two Sub Disposition values that represent a *numeric*
+# NPS rating being given (as opposed to the verbal / no-score positive-negative
+# categories). Any row tagged with one of these MUST count as "Removal" in the
+# Effective Call List, regardless of whether the NPS SCORE column itself was
+# actually filled in correctly during data entry.
 NUMERIC_FEEDBACK_LOWER = {
     normalize_dashes(POSITIVE_LIST[0].strip().lower()),
     normalize_dashes(NEGATIVE_LIST[0].strip().lower()),
@@ -65,15 +84,6 @@ def normalize_month(series):
     "Apr 2026", plain "April", etc.) into ONE canonical label ("Apr-26") + a numeric
     sort key (YYYYMM), so df and df2 always line up on the same Month values for
     filtering — even if one file writes months differently than the other.
-
-    *** FIX: EXCEL EPOCH ARTIFACT ("Dec-1899" etc.) ***
-    A Month cell formatted as a Date in Excel but actually blank (or holding a
-    stray 0) gets read back as a real Timestamp near Excel's epoch (year 1899
-    or 1900). No real call-center record is from 1899, so any date that parses
-    to a year before 1990 is this artifact, not a genuine month. Those rows
-    are dropped to NaN (not shown as text at all, not even "Unknown") so they
-    silently disappear from every filter dropdown, chart, and table instead of
-    leaking through as "Dec-1899".
     """
     s = series.astype(str).str.strip()
     parsed = pd.Series(pd.NaT, index=s.index).astype("datetime64[ns]")
@@ -99,24 +109,25 @@ def normalize_month(series):
         except Exception:
             pass
 
-    # Capture the Excel-epoch rows BEFORE we touch `parsed`, based on the actual
-    # parsed year rather than pattern-matching the raw string — this catches
-    # the artifact no matter how it was originally formatted (date object,
-    # "1899-12-30", "12/30/1899", "Dec-1899", etc).
-    epoch_mask = parsed.notna() & (parsed.dt.year < 1990)
+    # *** FIX: EXCEL EPOCH ARTIFACT ***
+    # A Month cell formatted as a Date in Excel but actually blank (or holding a
+    # stray 0) gets read back as a real Timestamp near Excel's epoch (e.g.
+    # "1899-12-01 00:00:00" / "1899-12-30"). No real call-center record is from
+    # 1899, so treat anything before 1990 as unparsed rather than a real month.
+    parsed = parsed.mask(parsed.dt.year < 1990, pd.NaT)
 
     label = parsed.dt.strftime("%b-%y")
     sort_key = (parsed.dt.year * 100 + parsed.dt.month)
 
-    # Genuinely unparseable text (e.g. a bare "May" with no year) falls back
-    # to a title-cased version of the raw text.
-    unparsed = label.isna() & (~epoch_mask)
-    label = label.mask(unparsed, s.str.title())
+    unparsed = label.isna()
+    # For genuinely unparseable text (e.g. a bare "May" with no year), fall back
+    # to a title-cased version of the raw text as before. But if the raw text
+    # IS the epoch artifact itself (a ~1899/1900 timestamp string), title-casing
+    # it would just re-display the same ugly value — show "Unknown" instead.
+    is_epoch_artifact = s.str.match(r"^(1899|1900)-", na=False)
+    fallback_label = s.str.title().mask(is_epoch_artifact, "Unknown")
+    label = label.mask(unparsed, fallback_label)
     sort_key = sort_key.mask(unparsed, 999999).astype(int)
-
-    # Epoch artifacts are dropped entirely (real NaN), never shown as text.
-    label = label.mask(epoch_mask, pd.NA)
-    sort_key = sort_key.mask(epoch_mask, pd.NA)
 
     return label, sort_key
 
@@ -250,6 +261,13 @@ def prepare_df(df_raw):
 
     if "DATE" in df.columns:
         df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce", dayfirst=True)
+        # *** FIX: EXCEL EPOCH ARTIFACT ***
+        # A cell formatted as a Date in Excel but actually left blank (or holding
+        # a stray 0) gets read back by pandas as a real Timestamp near Excel's
+        # epoch (e.g. "1899-12-01 00:00:00" / "1899-12-30"), not as blank. No
+        # real call-center record is from 1899, so anything before 1990 is this
+        # artifact — treat it as missing (NaT) so it never shows up in FY
+        # Quarter, Month, or any table/Excel export.
         df.loc[df["DATE"].dt.year < 1990, "DATE"] = pd.NaT
         fy_label, fy_sort = zip(*df["DATE"].apply(get_fy_quarter))
         df["FY Quarter"] = fy_label
@@ -267,6 +285,11 @@ def prepare_df(df_raw):
 
 
 def get_fy_quarter(date):
+    """
+    Indian Financial Year quarter label: FY runs April -> March.
+    Q1 = Apr-Jun, Q2 = Jul-Sep, Q3 = Oct-Dec, Q4 = Jan-Mar.
+    Returns (label, sort_key) e.g. ("Q1 (2024-25)", 20241).
+    """
     if pd.isna(date):
         return None, None
     month, year = date.month, date.year
@@ -284,6 +307,7 @@ def get_fy_quarter(date):
 
 
 def get_clean_contact_df2(df2):
+    """df2 rows where Contact is present and not the text 'NA'."""
     if "Contact" not in df2.columns:
         return df2.copy()
     mask = df2["Contact"].notna() & (df2["Contact"].astype(str).str.strip().str.upper() != "NA")
@@ -302,6 +326,15 @@ def add_connectivity_status(df2_clean):
 
 
 def apply_rating_shift(df2_clean):
+    """
+    Business rule: agar kisi record mein NPS Score diya gaya hai (rating hai),
+    to us record ko 'Removal' list mein count karo, chahe uska original
+    Call List 'Running' ho.
+
+    rated_mask do conditions se ban raha hai (OR):
+      1) NPS SCORE > 0
+      2) Sub Disposition numeric-feedback list mein hai (POSITIVE_NUM / NEGATIVE_NUM)
+    """
     df2_clean = df2_clean.copy()
     if "Call List" not in df2_clean.columns:
         return df2_clean
@@ -401,6 +434,12 @@ def build_city_summary(df2_raw, df2_clean, df):
 
 
 def build_table2_city_nps(df2_raw, df2_clean, df):
+    """
+    TABLE 2 — CITY-WISE NPS PERFORMANCE BREAKDOWN
+    Exact column order: City | Unique Patients | Missing Contact | Total Not Connected |
+    Total Connected | Positive Feedback | Negative Feedback | General Query
+    Sorted by Missing Contact, descending (matches the reference report).
+    """
     base = build_city_summary(df2_raw, df2_clean, df)
     cols = ["City", "Unique Patients", "Missing Contact", "Total Not Connected",
             "Total Connected", "Positive Feedback", "Negative Feedback", "General Query"]
@@ -491,6 +530,13 @@ def build_applicator_summary(df2_raw, df2_clean, df):
 
 
 def build_table3_applicator_defaulter(df2_raw, df2_clean, df):
+    """
+    TABLE 3 — APPLICATOR PERFORMANCE & DEFAULTER RANKING
+    Exact column order: Applicators | Unique Patients | Total Dressings | Missing Number |
+    Not Connected | Connected Calls | Positive Feedback | Negative Feedback |
+    General Feedback | NPS Given | Avg NPS Score
+    Sorted by Missing Number, descending (defaulters = most missing numbers first).
+    """
     base = build_applicator_summary(df2_raw, df2_clean, df)
     cols = ["Applicators", "Unique Patients", "Total Dressings", "Missing Number",
             "Not Connected", "Connected Calls", "Positive Feedback", "Negative Feedback",
@@ -506,6 +552,12 @@ def build_table3_applicator_defaulter(df2_raw, df2_clean, df):
 
 
 def build_hospital_doctor_summary(df2_raw, df):
+    """
+    Hospital Name | Doctor | Total Contact | Missing Contact | Total Unique Contact
+    Pure call-data (df2) table — deliberately does NOT merge in df's Unique Patients /
+    Total Dressings, since Hospital/Doctor spellings vary a lot between the two sheets
+    and that merge kept producing unreliable zeros. Sorted by Total Contact, descending.
+    """
     if "Hospital Name" not in df2_raw.columns or "Doctor" not in df2_raw.columns:
         return None
 
@@ -751,6 +803,22 @@ def build_performance_summary(df2_clean, df):
 
     add_row("Overall Feedback given", conn_r, conn_rem, conn_ov)
 
+    # *** FIX (this is the bug the user flagged): "Positive Feedback (NPS
+    # score in Number)" was showing 77 instead of the correct 75, because it
+    # was computed as "any row where NPS SCORE > 0" (has_number), with NO
+    # check on the Sub Disposition text at all. That silently swept in rows
+    # whose Sub Disposition wasn't actually positive (e.g. a stray/misentered
+    # numeric score on a Negative or General row).
+    #
+    # Correct rule (as confirmed by the user): a row counts as
+    # "Positive Feedback (NPS score in Number)" ONLY if BOTH are true:
+    #   1) Sub Disposition is one of the two positive values
+    #      ("Connected – Feedback Positive" / "Everything is good, no issue
+    #      at all") -> i.e. sub.isin(POSITIVE_LOWER)
+    #   2) NPS SCORE > 0
+    # Same symmetric logic applies to Negative. This also guarantees every
+    # positive/negative row is counted exactly once, split only by whether
+    # a number was given or not — no double counting.
     sub = df2_clean["Sub Disposition"].str.lower()
     has_number = df2_clean["NPS SCORE"] > 0 if "NPS SCORE" in df2_clean.columns else pd.Series(False, index=df2_clean.index)
 
@@ -814,15 +882,16 @@ def build_performance_summary(df2_clean, df):
 
 
 def build_monthly_trend(df2_clean):
+    """
+    Month-wise India-level trend: Total Connectivity / Total Not Connected /
+    Positive Feedback / Negative Feedback, one row per month, sorted
+    chronologically (uses the canonical Month + Month Sort columns).
+    """
     if df2_clean is None or df2_clean.empty or "Month" not in df2_clean.columns:
         return None
 
     d = df2_clean.copy()
     if "Month Sort" not in d.columns:
-        return None
-
-    d = d[d["Month"].notna()]
-    if d.empty:
         return None
 
     conn_mask = d["Connectivity Status"] == "Connected"
@@ -852,6 +921,10 @@ def build_monthly_trend(df2_clean):
 
 
 def build_monthly_trend_chart(monthly_trend):
+    """
+    Altair line chart with the actual number labelled above each point
+    (st.line_chart can't show data labels, so we build this manually).
+    """
     metrics = ["Total Connectivity", "Total Not Connected", "Positive Feedback", "Negative Feedback"]
     long_df = monthly_trend.melt(id_vars="Month", value_vars=metrics, var_name="Metric", value_name="Count")
     month_order = monthly_trend["Month"].tolist()
@@ -874,6 +947,20 @@ def build_monthly_trend_chart(monthly_trend):
 # ------------------------------------------------------------------
 
 def pct_diff(old_val, new_val):
+    """
+    Formula-driven % diff between two values from the same table cell,
+    used to build every comparison table below (Table 1, City, Applicator,
+    Hospital-Doctor). Handles three cell types that show up in these tables:
+
+    1) Blank / dash placeholders ("—", "-", "") -> stays a dash, no diff.
+    2) Existing percentage strings (e.g. "45.23%", as in the "Connectivity %"
+       row) -> returns the POINT difference (new% - old%). Taking a relative
+       % change of a percentage is misleading, so this is a straight subtraction.
+    3) Plain numbers (counts like Total Connectivity, Missing Contact, Avg NPS
+       Score, etc.) -> returns the RELATIVE % change: (new - old) / |old| * 100.
+       - old == 0 and new == 0  -> "0.00%"
+       - old == 0 and new != 0  -> "New" (can't divide by zero)
+    """
     def is_blank(v):
         return v is None or (isinstance(v, str) and v.strip() in ("—", "-", ""))
 
@@ -906,11 +993,19 @@ def pct_diff(old_val, new_val):
 
 
 def build_performance_comparison(table_a, table_b):
+    """
+    Row-by-row % diff between two build_performance_summary() outputs
+    (Month A = baseline, Month B = compared-to). Both tables share the exact
+    same METRIC order since they come from the same function, so we walk
+    them in lockstep rather than merging on METRIC text (which repeats for
+    section headers like "CONNECTIVITY").
+    """
     if table_a is None or table_b is None:
         return None
     rows = []
     for (_, ra), (_, rb) in zip(table_a.iterrows(), table_b.iterrows()):
         metric = ra["METRIC"]
+        # Section header rows (all three value columns blank) pass through unchanged
         if ra["RUNNING"] == "" and ra["REMOVAL"] == "" and ra["OVERALL"] == "":
             rows.append({"METRIC": metric, "RUNNING": "", "REMOVAL": "", "OVERALL": ""})
             continue
@@ -924,6 +1019,16 @@ def build_performance_comparison(table_a, table_b):
 
 
 def build_generic_comparison(table_a, table_b, key_cols, metric_cols, rename_map=None):
+    """
+    Generic % diff comparison between two snapshot tables that share the same
+    key column(s) — used for City, Applicator, and Hospital-Doctor comparisons.
+
+    key_cols:    columns identifying each row, e.g. ["City"] or
+                 ["Hospital Name", "Doctor"]
+    metric_cols: numeric columns to diff (via pct_diff)
+    rename_map:  optional {source_column: display_label} if the comparison
+                 column should be labeled differently than the source table
+    """
     if table_a is None or table_b is None:
         return None
 
@@ -1048,6 +1153,7 @@ if "df2_prepared" in st.session_state:
     k5.metric("Negative Feedback", kpis["Negative Feedback"])
     k6.metric("Avg NPS Score", kpis["Avg NPS Score"])
 
+    # Second KPI row — unique counts pulled straight from df (Patient/Dressing sheet)
     k7, k8, k9, k10 = st.columns(4)
     k7.metric("Total Unique Patients", int(df_filtered["Patient Name"].nunique()) if df_filtered is not None and "Patient Name" in df_filtered.columns else "—")
     k8.metric("Total Cities", int(df_filtered["City"].nunique()) if df_filtered is not None and "City" in df_filtered.columns else "—")
@@ -1106,19 +1212,10 @@ if "df2_prepared" in st.session_state:
     # ------------------------------------------------------------------
     # ------------------- MONTH-ON-MONTH COMPARISON -----------------------
     # ------------------------------------------------------------------
-    # *** FIX: MoM comparison is now completely independent of the sidebar
-    # filters (Applicator/City/Month/Call List/Quarter). Previously it built
-    # its two month-snapshots from df2_filtered / df_filtered, so if the
-    # person had e.g. a specific Month selected in the filters above, one (or
-    # both) of the two comparison months would have zero rows in the filtered
-    # data -> the comparison came out all NaN. It now always starts from the
-    # full, unfiltered df2_full / df_full, so it works the same no matter what
-    # the sidebar filters are set to.
     st.markdown("## Month-on-Month Comparison")
     st.caption(
         "Pick two months (e.g. April vs June) to see the % change for every table above — "
-        "same formulas as Table 1 / City / Applicator / Hospital-Doctor, just diffed between the two months. "
-        "This comparison always uses the full dataset and ignores the filters above."
+        "same formulas as Table 1 / City / Applicator / Hospital-Doctor, just diffed between the two months."
     )
 
     if len(month_options) >= 2:
@@ -1134,15 +1231,18 @@ if "df2_prepared" in st.session_state:
         if st.button("Generate Month-on-Month Comparison", type="primary"):
             def build_month_snapshot(month_label):
                 """
-                Deliberately starts from df2_full / df_full (NOT df2_filtered /
-                df_filtered) so this comparison is always computed from the
-                complete dataset, regardless of what's selected in the sidebar
-                filters above.
+                Build one month's clean/annotated call data + matching patient data,
+                using the SAME cleaning pipeline (get_clean_contact_df2 ->
+                add_connectivity_status -> apply_rating_shift) as the main report,
+                so every comparison table is built from numbers computed the exact
+                same way as the tables above — just isolated to one month.
+                Starts from df2_filtered / df_filtered so the sidebar Applicator /
+                City / Call List filters still apply to the comparison.
                 """
-                raw_month = df2_full[df2_full["Month"].astype(str) == month_label].copy()
+                raw_month = df2_filtered[df2_filtered["Month"].astype(str) == month_label].copy()
                 patients_month = None
-                if df_full is not None and "Month" in df_full.columns:
-                    patients_month = df_full[df_full["Month"].astype(str) == month_label].copy()
+                if df_filtered is not None and "Month" in df_filtered.columns:
+                    patients_month = df_filtered[df_filtered["Month"].astype(str) == month_label].copy()
                 clean_month = get_clean_contact_df2(raw_month)
                 clean_month = add_connectivity_status(clean_month)
                 clean_month = apply_rating_shift(clean_month)
@@ -1293,6 +1393,7 @@ if "df2_prepared" in st.session_state:
     except Exception as e:
         st.warning(f"Quarterly Kit by Applicator could not be built: {e}")
 
+    # Include the Month-on-Month comparison tables (if generated) in the Excel export
     if "cmp_results" in st.session_state:
         cmp_results = st.session_state["cmp_results"]
         for name, table in cmp_results.items():
